@@ -228,11 +228,14 @@ jobs:
           LB_URL="https://${LB_IP}.sslip.io"
           echo "url=${LB_URL}" >> "$GITHUB_OUTPUT"
 
-          PROJECT_NUMBER="$(curl -sf -H 'Metadata-Flavor: Google' \
-            http://metadata.google.internal/computeMetadata/v1/project/numeric-project-id)"
-          BACKEND_ID="$(gcloud compute backend-services describe "$LB_BACKEND_SERVICE" \
-                          --global --format='value(id)')"
-          AUDIENCE="/projects/${PROJECT_NUMBER}/global/backendServices/${BACKEND_ID}"
+          AUDIENCE="$(gcloud compute backend-services describe "$LB_BACKEND_SERVICE" \
+                        --global --format='value(iap.oauth2ClientId)')"
+
+          if [ -z "$AUDIENCE" ]; then
+            echo "result=no-client" >> "$GITHUB_OUTPUT"
+            echo "::warning::Backend ${LB_BACKEND_SERVICE} reports no IAP OAuth client id. It is still on the Google-managed client, which does not support programmatic access - apply the infra change first."
+            exit 0
+          fi
 
           TOKEN="$(curl -sf -H 'Metadata-Flavor: Google' \
             "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/identity?audience=${AUDIENCE}")"
@@ -247,7 +250,7 @@ jobs:
             echo "::notice::Load balancer answered 200 for ${LB_URL}"
           elif [ "$CODE" = "403" ] || [ "$CODE" = "401" ]; then
             echo "result=forbidden" >> "$GITHUB_OUTPUT"
-            echo "::warning::IAP refused the runner's identity (HTTP ${CODE}). The application is verified healthy on every instance."
+            echo "::warning::IAP refused the runner's identity (HTTP ${CODE}). Expected only if sa-ops-vm has dropped off the backend service's accessor list - check LB_ALLOWED_MEMBERS. The application is verified healthy on every instance."
           else
             echo "result=unexpected" >> "$GITHUB_OUTPUT"
             echo "::warning::Load balancer returned HTTP ${CODE} for ${LB_URL}."
@@ -311,6 +314,7 @@ jobs:
             case "${LB_RESULT:-none}" in
               ok)         echo " HTTP ${LB_CODE} through IAP." ;;
               forbidden)  echo " HTTP ${LB_CODE} — IAP refused the runner's identity. \`sa-ops-vm\` is not on the backend service's accessor list. The link above works for a human on the allow-list." ;;
+              no-client)  echo " Not checked — the backend service still uses the Google-managed OAuth client, which has no programmatic access. Apply the infra change that moves it to a custom client." ;;
               unexpected) echo " HTTP ${LB_CODE} — unexpected. Check the backend service health." ;;
               *)          echo "Not checked." ;;
             esac
