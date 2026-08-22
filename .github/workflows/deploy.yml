@@ -33,7 +33,7 @@ env:
 
   LB_ADDRESS_NAME: petclinic-dev-lb-ip
   LB_BACKEND_SERVICE: petclinic-dev-lb-backend
-  APP_ZONES: europe-west3-a,europe-west3-b,europe-west3-c
+  APP_REGION: europe-west3
 
 jobs:
   deploy:
@@ -173,8 +173,7 @@ jobs:
 
           mapfile -t INSTANCES < <(
             gcloud compute instances list \
-              --zones="$APP_ZONES" \
-              --filter='tags.items=app AND status=RUNNING' \
+              --filter="tags.items=app AND status=RUNNING AND zone:${APP_REGION}" \
               --format='value(name,networkInterfaces[0].networkIP)'
           )
 
