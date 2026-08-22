@@ -33,7 +33,7 @@ env:
 
   LB_ADDRESS_NAME: petclinic-dev-lb-ip
   LB_BACKEND_SERVICE: petclinic-dev-lb-backend
-  APP_ZONES: europe-west3-a,europe-west3-b,europe-west3-c
+  APP_REGION: europe-west3
 
 jobs:
   deploy:
@@ -173,8 +173,7 @@ jobs:
 
           mapfile -t INSTANCES < <(
             gcloud compute instances list \
-              --zones="$APP_ZONES" \
-              --filter='tags.items=app AND status=RUNNING' \
+              --filter="tags.items=app AND status=RUNNING AND zone:${APP_REGION}" \
               --format='value(name,networkInterfaces[0].networkIP)'
           )
 
@@ -247,7 +246,7 @@ jobs:
             echo "::notice::Load balancer answered 200 for ${LB_URL}"
           elif [ "$CODE" = "403" ] || [ "$CODE" = "401" ]; then
             echo "result=forbidden" >> "$GITHUB_OUTPUT"
-            echo "::warning::IAP refused the runner's identity (HTTP ${CODE}). The application is verified healthy on every instance."
+            echo "::warning::IAP will not accept a service-account token for this backend (Google-managed OAuth client) - HTTP ${CODE}, expected. The application is verified healthy on every instance."
           else
             echo "result=unexpected" >> "$GITHUB_OUTPUT"
             echo "::warning::Load balancer returned HTTP ${CODE} for ${LB_URL}."
@@ -310,7 +309,7 @@ jobs:
             echo
             case "${LB_RESULT:-none}" in
               ok)         echo " HTTP ${LB_CODE} through IAP." ;;
-              forbidden)  echo " HTTP ${LB_CODE} — IAP refused the runner's identity. \`sa-ops-vm\` is not on the backend service's accessor list. The link above works for a human on the allow-list." ;;
+              forbidden)  echo " HTTP ${LB_CODE} — IAP does not accept a service-account token for this backend (Google-managed OAuth client). Expected; the link above works for a human on the allow-list." ;;
               unexpected) echo " HTTP ${LB_CODE} — unexpected. Check the backend service health." ;;
               *)          echo "Not checked." ;;
             esac
