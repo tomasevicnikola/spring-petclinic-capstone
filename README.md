@@ -157,14 +157,25 @@ gh workflow run deploy.yml -f version=v1.2.0 -f environment=dev
 ```
 
 It verifies the tag exists here and in Artifact Registry, resolves it to a
-digest, and deploys that digest. The job summary has the application URL,
-the digest and per-instance health.
+digest, records that digest as what the environment runs, and deploys it. The
+job summary has the application URL, the digest and per-instance health.
 
-**Rollback is redeploy** — dispatch the same workflow with an older version.
+It writes the digest to the state bucket and triggers the apply in
+[petclinic-infra](https://github.com/tomasevicnikola/petclinic-infra), which
+rebuilds the instance template around it. The group then replaces its instances;
+nothing connects to a VM, because they boot from an image that already contains
+everything but the version.
 
-**One-time setup:** Settings → Environments → New environment named **`dev`**,
-with yourself under Required reviewers. The name must match the `environment`
-input.
+**Rollback is redeploy** — same workflow, older version.
+
+### One-time setup
+
+1. Settings → Environments → new environment **`dev`**, with yourself under
+   Required reviewers. The name must match the `environment` input.
+2. Settings → Secrets → Actions → **`INFRA_DISPATCH_TOKEN`**: a fine-grained PAT
+   scoped to `petclinic-infra` with **Actions: read and write**. The deploy
+   needs it because `GITHUB_TOKEN` cannot dispatch a workflow in another
+   repository.
 
 The job runs on the self-hosted runner on the ops VM, because no VM in the
 project has a public IP. It is `workflow_dispatch`-only, and the Ansible tree it
