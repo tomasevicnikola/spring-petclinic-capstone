@@ -133,12 +133,17 @@ jobs:
           set -euo pipefail
           OBJECT="gs://${DEPLOY_STATE_BUCKET}/deploy/${ENVIRONMENT}/app-image-digest"
 
-          PREVIOUS="$(gcloud storage cat "$OBJECT" 2>/dev/null | tr -d '[:space:]' || true)"
-          if [ -n "$PREVIOUS" ]; then
+          # Not "|| true": swallowing this once reported a 403 as "first deploy",
+          # which is a different thing and hid the real cause.
+          if PREVIOUS="$(gcloud storage cat "$OBJECT" 2>"${RUNNER_TEMP}/cat.err")"; then
+            PREVIOUS="$(printf '%s' "$PREVIOUS" | tr -d '[:space:]')"
             echo "Currently deployed: ${PREVIOUS}"
             echo "previous=${PREVIOUS}" >> "$GITHUB_OUTPUT"
           else
-            echo "::notice::No digest recorded yet for ${ENVIRONMENT}; this is the first rolling deploy."
+            echo "Could not read the current digest:"
+            sed 's/^/  /' "${RUNNER_TEMP}/cat.err"
+            echo "Either nothing is recorded yet, or the object is unreadable."
+            echo "The write below decides which."
           fi
 
           printf '%s' "$DIGEST" | gcloud storage cp - "$OBJECT"
