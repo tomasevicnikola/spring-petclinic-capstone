@@ -26,7 +26,6 @@ env:
   IMAGE_REPO: europe-west3-docker.pkg.dev/petclinic-capstone/petclinic/petclinic-app
 
   INFRA_REPO: tomasevicnikola/petclinic-infra
-  INFRA_DIR: infra
 
   APP_PORT: "8080"
   HEALTH_PATH: /actuator/health
@@ -35,6 +34,12 @@ env:
   LB_BACKEND_SERVICE: petclinic-dev-lb-backend
   APP_REGION: europe-west3
 
+  # The rolling deploy writes the digest here; the infrastructure repository
+  # reads it on every plan.
+  APP_MIG: petclinic-dev-app-mig
+  DEPLOY_STATE_BUCKET: petclinic-capstone-tfstate
+  INFRA_APPLY_WORKFLOW: terraform-apply.yml
+
 jobs:
   deploy:
     name: Deploy ${{ inputs.version }} to ${{ inputs.environment }}
@@ -42,7 +47,7 @@ jobs:
     if: github.event_name == 'workflow_dispatch'
     environment: ${{ inputs.environment }}
 
-    timeout-minutes: 30
+    timeout-minutes: 60
 
     permissions:
       contents: read
@@ -65,14 +70,6 @@ jobs:
       - name: Checkout this repository
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
-          persist-credentials: false
-
-      - name: Checkout the infrastructure repository
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
-        with:
-          repository: ${{ env.INFRA_REPO }}
-          ref: main
-          path: ${{ env.INFRA_DIR }}
           persist-credentials: false
 
       - name: Confirm the runner's GCP identity
@@ -123,48 +120,212 @@ jobs:
 
           echo "::notice::${VERSION} resolves to ${IMAGE_REPO}@${DIGEST}"
 
-      - name: Install the Ansible collections
-        working-directory: ${{ env.INFRA_DIR }}/ansible
+
+      # Rolling deploy: record the digest, let the infrastructure repository
+      # rebuild the instance template around it, let the group replace its
+      # instances.
+      - name: Record the digest as the deployed version
+        id: record
+        env:
+          DIGEST: ${{ steps.resolve.outputs.digest }}
+          ENVIRONMENT: ${{ inputs.environment }}
         run: |
           set -euo pipefail
-          ansible-galaxy collection install -r requirements.yml
-          ansible --version
+          OBJECT="gs://${DEPLOY_STATE_BUCKET}/deploy/${ENVIRONMENT}/app-image-digest"
 
-      - name: Prepare an OS Login key for this run
-        id: oslogin
+          PREVIOUS="$(gcloud storage cat "$OBJECT" 2>/dev/null | tr -d '[:space:]' || true)"
+          if [ -n "$PREVIOUS" ]; then
+            echo "Currently deployed: ${PREVIOUS}"
+            echo "previous=${PREVIOUS}" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::No digest recorded yet for ${ENVIRONMENT}; this is the first rolling deploy."
+          fi
+
+          printf '%s' "$DIGEST" | gcloud storage cp - "$OBJECT"
+          echo "Recorded ${DIGEST} at ${OBJECT}"
+
+      - name: Trigger the infrastructure apply
+        id: infra
+        env:
+          GH_TOKEN: ${{ secrets.INFRA_DISPATCH_TOKEN }}
+          ENVIRONMENT: ${{ inputs.environment }}
         run: |
           set -euo pipefail
-          KEY="${RUNNER_TEMP}/oslogin_${GITHUB_RUN_ID}"
-          ssh-keygen -t ed25519 -N '' -C "deploy-${GITHUB_RUN_ID}" -f "$KEY" >/dev/null
-          gcloud compute os-login ssh-keys add --key-file="${KEY}.pub" --ttl=45m >/dev/null
 
-          OSLOGIN_USER="$(gcloud compute os-login describe-profile \
-                            --format='value(posixAccounts[0].username)')"
-          if [ -z "$OSLOGIN_USER" ]; then
-            echo "::error::sa-ops-vm has no OS Login POSIX profile; cannot resolve ansible_user."
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::error::INFRA_DISPATCH_TOKEN is not set. This deploy dispatches a workflow in ${INFRA_REPO}, which the built-in GITHUB_TOKEN cannot do across repositories. Add a fine-grained PAT scoped to that repository with Actions: read and write."
             exit 1
           fi
 
-          {
-            echo "key=${KEY}"
-            echo "user=${OSLOGIN_USER}"
-          } >> "$GITHUB_OUTPUT"
-          echo "OS Login user: ${OSLOGIN_USER}"
+          # The REST API rather than the gh CLI, which is not on the ops runner.
+          api() {
+            curl -sS --fail-with-body \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "$@"
+          }
 
-      - name: Deploy the application with Ansible
-        working-directory: ${{ env.INFRA_DIR }}/ansible
+          # The dispatch endpoint returns no body, so the run is found by time.
+          SINCE="$(date -u -d '-60 seconds' +%Y-%m-%dT%H:%M:%SZ)"
+
+          api -X POST \
+            "https://api.github.com/repos/${INFRA_REPO}/actions/workflows/${INFRA_APPLY_WORKFLOW}/dispatches" \
+            -d "$(jq -nc --arg env "$ENVIRONMENT" '{ref: "main", inputs: {environment: $env}}')" \
+            -o /dev/null
+          echo "Dispatched ${INFRA_APPLY_WORKFLOW} in ${INFRA_REPO}."
+
+          RUN_ID=""
+          for _ in $(seq 1 30); do
+            RUN_ID="$(api "https://api.github.com/repos/${INFRA_REPO}/actions/workflows/${INFRA_APPLY_WORKFLOW}/runs?per_page=20&event=workflow_dispatch" \
+                      | jq -r --arg since "$SINCE" \
+                          '[.workflow_runs[] | select(.created_at >= $since)]
+                           | sort_by(.created_at) | last | .id // empty')"
+            [ -n "$RUN_ID" ] && break
+            sleep 5
+          done
+
+          if [ -z "$RUN_ID" ]; then
+            echo "::error::Dispatched the apply but could not find the run in ${INFRA_REPO}. Check it manually before retrying - the digest is already recorded."
+            exit 1
+          fi
+
+          RUN_URL="${GITHUB_SERVER_URL}/${INFRA_REPO}/actions/runs/${RUN_ID}"
+          echo "run_url=${RUN_URL}" >> "$GITHUB_OUTPUT"
+          echo "::notice::Infrastructure apply: ${RUN_URL}"
+
+          # The apply sits behind an environment approval, so "waiting" is normal.
+          echo "Waiting for the apply (this includes any environment approval)..."
+          for attempt in $(seq 1 120); do
+            RUN="$(api "https://api.github.com/repos/${INFRA_REPO}/actions/runs/${RUN_ID}")"
+            STATUS="$(echo "$RUN" | jq -r .status)"
+            CONCLUSION="$(echo "$RUN" | jq -r '.conclusion // ""')"
+
+            if [ "$STATUS" = "completed" ]; then
+              if [ "$CONCLUSION" = "success" ]; then
+                echo "Apply succeeded after $(( attempt * 20 ))s."
+                break
+              fi
+              echo "::error::The infrastructure apply finished as '${CONCLUSION}'. See ${RUN_URL}"
+              exit 1
+            fi
+
+            if [ "$attempt" -eq 120 ]; then
+              echo "::error::The infrastructure apply was still '${STATUS}' after 40 minutes. See ${RUN_URL}"
+              exit 1
+            fi
+
+            [ $(( attempt % 6 )) -eq 1 ] && echo "apply is ${STATUS}... (${attempt}/120)"
+            sleep 20
+          done
+
+      # Without this, nothing compares what was deployed to what is running: the
+      # rollout wait below is satisfied trivially by a no-op apply, and the old
+      # version answers the health check just as well as the new one.
+      - name: Confirm the template carries the digest that was deployed
         env:
-          IMAGE: ${{ steps.resolve.outputs.image }}
-          OSLOGIN_USER: ${{ steps.oslogin.outputs.user }}
-          ANSIBLE_SSH_PRIVATE_KEY_FILE: ${{ steps.oslogin.outputs.key }}
-          ANSIBLE_FORCE_COLOR: "1"
+          DIGEST: ${{ steps.resolve.outputs.digest }}
+          ENVIRONMENT: ${{ inputs.environment }}
         run: |
           set -euo pipefail
-          ansible-playbook playbooks/app.yml \
-            --tags common,docker,app_deploy \
-            -e app_deploy_image="${IMAGE}" \
-            -e app_deploy_placeholder=false \
-            -e ansible_ssh_private_key_file="${ANSIBLE_SSH_PRIVATE_KEY_FILE}"
+
+          TEMPLATE="$(gcloud compute instance-groups managed describe "$APP_MIG" \
+                        --region="$APP_REGION" \
+                        --format='value(versions[0].instanceTemplate)')"
+          TEMPLATE="${TEMPLATE##*/}"
+
+          ON_TEMPLATE="$(gcloud compute instance-templates describe "$TEMPLATE" --format=json \
+                         | jq -r '.properties.metadata.items[]? | select(.key=="app-image-digest") | .value')"
+
+          echo "Template:          ${TEMPLATE}"
+          echo "Digest requested:  ${DIGEST}"
+          echo "Digest on template: ${ON_TEMPLATE:-<absent>}"
+
+          if [ -z "${ON_TEMPLATE}" ]; then
+            echo "::error::The instance template has no app-image-digest metadata at all. The infrastructure repository is applying a revision that predates the baked-image change - merge and apply that branch first."
+            exit 1
+          fi
+
+          if [ "${ON_TEMPLATE}" != "${DIGEST}" ]; then
+            echo "::error::The apply completed but left ${ON_TEMPLATE} on the template, not ${DIGEST}. The digest object was probably not read - check that deploy/${ENVIRONMENT}/app-image-digest in the state bucket holds the value this run wrote."
+            exit 1
+          fi
+
+          echo "::notice::Template ${TEMPLATE} carries ${DIGEST}."
+
+      - name: Wait for the group to roll onto the new template
+        run: |
+          set -euo pipefail
+
+          TEMPLATE="$(gcloud compute instance-groups managed describe "$APP_MIG" \
+                        --region="$APP_REGION" \
+                        --format='value(versions[0].instanceTemplate)')"
+          TEMPLATE="${TEMPLATE##*/}"
+          echo "Target template: ${TEMPLATE}"
+
+          # apply returns once the version is set, not once the rollout finishes,
+          # so isStable alone can read True before anything has been replaced.
+          rollout_state() {
+            gcloud compute instance-groups managed describe "$APP_MIG" \
+              --region="$APP_REGION" --format='value(status.isStable)'
+          }
+
+          instances() {
+            gcloud compute instance-groups managed list-instances "$APP_MIG" \
+              --region="$APP_REGION" \
+              --format='value(name,instanceStatus,version.instanceTemplate,instanceHealth[0].detailedHealthState)'
+          }
+
+          DONE=0
+          for attempt in $(seq 1 60); do
+            STABLE="$(rollout_state)"
+            ON_TARGET=1
+            COUNT=0
+
+            while read -r NAME STATUS ITEMPLATE HEALTH; do
+              [ -z "${NAME:-}" ] && continue
+              COUNT=$(( COUNT + 1 ))
+              [ "${ITEMPLATE##*/}" = "$TEMPLATE" ] || ON_TARGET=0
+            done < <(instances)
+
+            if [ "$STABLE" = "True" ] && [ "$ON_TARGET" -eq 1 ] && [ "$COUNT" -gt 0 ]; then
+              echo "Rollout complete after ${attempt} check(s): ${COUNT} instance(s) on ${TEMPLATE}."
+              DONE=1
+              break
+            fi
+
+            if [ $(( attempt % 6 )) -eq 1 ]; then
+              echo "rolling... (check ${attempt}/60, stable=${STABLE}, all-on-target=${ON_TARGET}, instances=${COUNT})"
+            fi
+            sleep 20
+          done
+
+          echo "::group::Instances"
+          gcloud compute instance-groups managed list-instances "$APP_MIG" \
+            --region="$APP_REGION" \
+            --format='table(name,instanceStatus,version.instanceTemplate.basename(),instanceHealth[0].detailedHealthState)'
+          echo "::endgroup::"
+
+          if [ "$DONE" -ne 1 ]; then
+            echo "::error::The group did not finish rolling onto ${TEMPLATE} within 20 minutes."
+            exit 1
+          fi
+
+          FAILED=0
+          while read -r NAME STATUS ITEMPLATE HEALTH; do
+            [ -z "${NAME:-}" ] && continue
+            if [ "$STATUS" != "RUNNING" ]; then
+              echo "::error::${NAME} is ${STATUS}, not RUNNING."
+              FAILED=1
+            elif [ "$HEALTH" != "HEALTHY" ]; then
+              echo "::error::${NAME} reports health ${HEALTH:-unknown}."
+              FAILED=1
+            else
+              echo "${NAME}: ${TEMPLATE}, RUNNING, HEALTHY"
+            fi
+          done < <(instances)
+
+          exit "$FAILED"
 
       - name: Verify each instance directly
         id: vms
@@ -264,6 +425,8 @@ jobs:
           IMAGE: ${{ steps.resolve.outputs.image }}
           IMAGE_TAG: ${{ steps.resolve.outputs.image_tag }}
           VM_COUNT: ${{ steps.vms.outputs.count }}
+          INFRA_RUN_URL: ${{ steps.infra.outputs.run_url }}
+          PREVIOUS_DIGEST: ${{ steps.record.outputs.previous }}
           LB_URL: ${{ steps.lb.outputs.url }}
           LB_CODE: ${{ steps.lb.outputs.code }}
           LB_RESULT: ${{ steps.lb.outputs.result }}
@@ -293,6 +456,18 @@ jobs:
             echo "| Digest | \`${DIGEST:-unresolved}\` |"
             echo "| Deployed reference | \`${IMAGE:-unresolved}\` |"
             echo "| Instances | ${VM_COUNT:-0} |"
+            echo
+
+            echo "### How this shipped"
+            echo
+            echo "The digest was written to \`gs://${DEPLOY_STATE_BUCKET}/deploy/${ENVIRONMENT:-dev}/app-image-digest\`,"
+            echo "then \`${INFRA_REPO}\` applied: the instance template was rebuilt around the new"
+            echo "metadata and the group replaced its instances, \`max_unavailable = 0\`. Nothing"
+            echo "connected to a VM - the image was already complete."
+            if [ -n "${INFRA_RUN_URL:-}" ]; then
+              echo
+              echo "[Infrastructure apply run](${INFRA_RUN_URL})"
+            fi
             echo
 
             echo "### Per-instance health"
@@ -328,21 +503,11 @@ jobs:
             echo "  -f version=<previous-version> \\"
             echo "  -f environment=${ENVIRONMENT:-dev}"
             echo '```'
+            if [ -n "${PREVIOUS_DIGEST:-}" ]; then
+              echo
+              echo "The version this replaced was \`${PREVIOUS_DIGEST}\`."
+            fi
             echo
             echo "[Artifact Registry](https://console.cloud.google.com/artifacts/docker/petclinic-capstone/europe-west3/petclinic/petclinic-app) · [tags](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/tags)"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Revoke the run's OS Login key
-        if: always()
-        env:
-          KEY: ${{ steps.oslogin.outputs.key }}
-        run: |
-          set -euo pipefail
-          if [ -n "${KEY:-}" ] && [ -f "${KEY}.pub" ]; then
-            gcloud compute os-login ssh-keys remove --key-file="${KEY}.pub" >/dev/null 2>&1 \
-              || echo "::warning::Could not remove the run's OS Login key; it expires within 45 minutes."
-            rm -f "${KEY}" "${KEY}.pub"
-            echo "Run key revoked."
-          else
-            echo "No run key to revoke."
-          fi
