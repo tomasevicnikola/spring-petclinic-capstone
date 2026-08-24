@@ -12,6 +12,8 @@ on:
         type: choice
         options:
           - dev
+          - qa
+          - prod
         default: dev
         required: true
 
@@ -30,20 +32,38 @@ env:
   APP_PORT: "8080"
   HEALTH_PATH: /actuator/health
 
-  LB_ADDRESS_NAME: petclinic-dev-lb-ip
-  LB_BACKEND_SERVICE: petclinic-dev-lb-backend
+  LB_ADDRESS_NAME: petclinic-${{ inputs.environment }}-lb-ip
+  LB_BACKEND_SERVICE: petclinic-${{ inputs.environment }}-lb-backend
   APP_REGION: europe-west3
 
   # The rolling deploy writes the digest here; the infrastructure repository
   # reads it on every plan.
-  APP_MIG: petclinic-dev-app-mig
+  APP_MIG: petclinic-${{ inputs.environment }}-app-mig
+  APP_INSTANCE_PREFIX: petclinic-${{ inputs.environment }}-app-
   DEPLOY_STATE_BUCKET: petclinic-capstone-tfstate
   INFRA_APPLY_WORKFLOW: terraform-apply.yml
 
 jobs:
+  guard:
+    name: Check the target is deployable
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Refuse prod
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+        run: |
+          if [ "$ENVIRONMENT" = "prod" ]; then
+            echo "::error::prod deploys are out of capstone scope. envs/prod exists in the infrastructure repository as a reviewed statement of intent and has never been applied - there is nothing running to deploy to. See docs/adr/0002-multi-environment-strategy.md in petclinic-infra."
+            exit 1
+          fi
+          echo "Target '${ENVIRONMENT}' is deployable."
+
   deploy:
     name: Deploy ${{ inputs.version }} to ${{ inputs.environment }}
     runs-on: [self-hosted, gcp, ops]
+    needs: guard
     if: github.event_name == 'workflow_dispatch'
     environment: ${{ inputs.environment }}
 
@@ -154,6 +174,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.INFRA_DISPATCH_TOKEN }}
           ENVIRONMENT: ${{ inputs.environment }}
+          DIGEST: ${{ steps.resolve.outputs.digest }}
         run: |
           set -euo pipefail
 
@@ -176,9 +197,10 @@ jobs:
 
           api -X POST \
             "https://api.github.com/repos/${INFRA_REPO}/actions/workflows/${INFRA_APPLY_WORKFLOW}/dispatches" \
-            -d "$(jq -nc --arg env "$ENVIRONMENT" '{ref: "main", inputs: {environment: $env}}')" \
+            -d "$(jq -nc --arg env "$ENVIRONMENT" --arg digest "$DIGEST" \
+                    '{ref: "main", inputs: {environment: $env, app_image_digest: $digest}}')" \
             -o /dev/null
-          echo "Dispatched ${INFRA_APPLY_WORKFLOW} in ${INFRA_REPO}."
+          echo "Dispatched ${INFRA_APPLY_WORKFLOW} in ${INFRA_REPO} for ${ENVIRONMENT} at ${DIGEST}."
 
           RUN_ID=""
           for _ in $(seq 1 30); do
@@ -332,19 +354,61 @@ jobs:
 
           exit "$FAILED"
 
-      - name: Verify each instance directly
-        id: vms
+      # Other environments have their own VPC and are not routable from the ops
+      # runner, so the per-instance verdict comes from the health check instead.
+      - name: Verify each instance through the load balancer's health check
+        id: vms_lb
+        if: inputs.environment != 'dev'
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
         run: |
           set -euo pipefail
 
+          echo "::notice::${ENVIRONMENT} is in its own VPC and is not routable from the ops runner. Using the load balancer's per-instance health state, which requests the same ${HEALTH_PATH}."
+
+          : > vm-health.md
+          COUNT=0
+          FAILED=0
+
+          while read -r NAME STATUS HEALTH; do
+            [ -z "${NAME:-}" ] && continue
+            COUNT=$(( COUNT + 1 ))
+            echo "| \`${NAME}\` | health check | ${STATUS} | ${HEALTH:-unknown} |" >> vm-health.md
+            if [ "$STATUS" != "RUNNING" ] || [ "$HEALTH" != "HEALTHY" ]; then
+              echo "::error::${NAME} is ${STATUS}/${HEALTH:-unknown}."
+              FAILED=1
+            else
+              echo "${NAME}: ${STATUS}, ${HEALTH}"
+            fi
+          done < <(
+            gcloud compute instance-groups managed list-instances "$APP_MIG" \
+              --region="$APP_REGION" \
+              --format='value(name,instanceStatus,instanceHealth[0].detailedHealthState)'
+          )
+
+          if [ "$COUNT" -eq 0 ]; then
+            echo "::error::The managed instance group ${APP_MIG} is empty."
+            exit 1
+          fi
+
+          echo "count=${COUNT}" >> "$GITHUB_OUTPUT"
+          exit "$FAILED"
+
+      - name: Verify each instance directly
+        id: vms
+        if: inputs.environment == 'dev'
+        run: |
+          set -euo pipefail
+
+          # Scoped by name: the 'app' tag is per-VPC and used by every environment.
           mapfile -t INSTANCES < <(
             gcloud compute instances list \
-              --filter="tags.items=app AND status=RUNNING AND zone:${APP_REGION}" \
+              --filter="tags.items=app AND name~^${APP_INSTANCE_PREFIX} AND status=RUNNING AND zone:${APP_REGION}" \
               --format='value(name,networkInterfaces[0].networkIP)'
           )
 
           if [ "${#INSTANCES[@]}" -eq 0 ]; then
-            echo "::error::No RUNNING instances tagged 'app'. The managed instance group is empty."
+            echo "::error::No RUNNING instances named ${APP_INSTANCE_PREFIX}* and tagged 'app'. The managed instance group for this environment is empty."
             exit 1
           fi
 
@@ -429,7 +493,7 @@ jobs:
           DIGEST: ${{ steps.resolve.outputs.digest }}
           IMAGE: ${{ steps.resolve.outputs.image }}
           IMAGE_TAG: ${{ steps.resolve.outputs.image_tag }}
-          VM_COUNT: ${{ steps.vms.outputs.count }}
+          VM_COUNT: ${{ steps.vms.outputs.count || steps.vms_lb.outputs.count }}
           INFRA_RUN_URL: ${{ steps.infra.outputs.run_url }}
           PREVIOUS_DIGEST: ${{ steps.record.outputs.previous }}
           LB_URL: ${{ steps.lb.outputs.url }}
@@ -465,7 +529,7 @@ jobs:
 
             echo "### How this shipped"
             echo
-            echo "The digest was written to \`gs://${DEPLOY_STATE_BUCKET}/deploy/${ENVIRONMENT:-dev}/app-image-digest\`,"
+            echo "The digest was written to \`gs://${DEPLOY_STATE_BUCKET}/deploy/${ENVIRONMENT}/app-image-digest\`,"
             echo "then \`${INFRA_REPO}\` applied: the instance template was rebuilt around the new"
             echo "metadata and the group replaced its instances, \`max_unavailable = 0\`. Nothing"
             echo "connected to a VM - the image was already complete."
@@ -485,7 +549,11 @@ jobs:
               echo "| - | - | not reached | - |"
             fi
             echo
-            echo "Checked against each internal IP, not through the load balancer. \`Database: UP\` is the Actuator \`db\` component."
+            if [ "${ENVIRONMENT}" = "dev" ]; then
+              echo "Checked against each internal IP, not through the load balancer. \`Database: UP\` is the Actuator \`db\` component."
+            else
+              echo "Checked through the load balancer's per-instance health check, which requests the same \`${HEALTH_PATH}\`. ${ENVIRONMENT} has its own VPC and is not routable from the ops runner, so there is no direct path to each instance. Spring Boot reports the aggregate DOWN when the database indicator is, so HEALTHY still means the database is connected."
+            fi
             echo
 
             echo "### Load balancer"
@@ -506,7 +574,7 @@ jobs:
             echo '```sh'
             echo "gh workflow run deploy.yml -R ${GITHUB_REPOSITORY} \\"
             echo "  -f version=<previous-version> \\"
-            echo "  -f environment=${ENVIRONMENT:-dev}"
+            echo "  -f environment=${ENVIRONMENT}"
             echo '```'
             if [ -n "${PREVIOUS_DIGEST:-}" ]; then
               echo
