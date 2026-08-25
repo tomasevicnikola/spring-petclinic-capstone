@@ -81,6 +81,9 @@ jobs:
       contents: read
 
     steps:
+      - name: Isolate the gcloud configuration
+        run: echo "CLOUDSDK_CONFIG=${RUNNER_TEMP}/gcloud" >> "$GITHUB_ENV"
+
       - name: Resolve the version
         id: version
         env:
@@ -117,10 +120,19 @@ jobs:
           persist-credentials: false
 
       - name: Confirm the runner's GCP identity
+        env:
+          EXPECTED: sa-ops-vm@petclinic-capstone.iam.gserviceaccount.com
         run: |
           set -euo pipefail
           gcloud auth list
-          echo "Project: $(gcloud config get-value project 2>/dev/null)"
+
+          ACTIVE="$(gcloud auth list --filter=status:ACTIVE --format='value(account)')"
+          if [ "$ACTIVE" != "$EXPECTED" ]; then
+            echo "::error::Runner is authenticated as '${ACTIVE:-<none>}', expected ${EXPECTED}. Another workflow on this runner left its credentials behind; every gcloud call below would run as the wrong identity and fail in a way that looks like a missing image."
+            exit 1
+          fi
+
+          echo "Running as ${ACTIVE}. Project: $(gcloud config get-value project 2>/dev/null)"
 
       - name: Resolve the version to an image digest
         id: resolve
