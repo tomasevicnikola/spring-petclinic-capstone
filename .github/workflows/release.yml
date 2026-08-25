@@ -210,6 +210,23 @@ jobs:
           git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
             "refs/tags/${NEW_TAG}"
 
+      - name: Publish the release
+        env:
+          NEW_TAG: ${{ steps.version.outputs.tag }}
+          IMAGE_VERSION: ${{ steps.ref.outputs.image_version }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cat > release-notes.md <<EOF
+          Image: \`${IMAGE_VERSION}\`
+          Digest: \`${DIGEST:-unavailable}\`
+          EOF
+
+          gh release create "$NEW_TAG" \
+            --title "$NEW_TAG" \
+            --generate-notes \
+            --notes-file release-notes.md
+
       - name: Release summary
         env:
           NEW_TAG: ${{ steps.version.outputs.tag }}
