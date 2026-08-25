@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Release tag, e.g. v1.2.0"
+        description: "Optional. Release tag such as v1.2.0; leave empty to deploy the latest release."
         type: string
-        required: true
+        required: false
       environment:
         description: Target environment
         type: choice
@@ -50,18 +50,26 @@ jobs:
     timeout-minutes: 5
     permissions: {}
     steps:
-      - name: Refuse prod
+      - name: prod deploys need ALLOW_PROD_DEPLOY
         env:
           ENVIRONMENT: ${{ inputs.environment }}
+          ALLOW_PROD_DEPLOY: ${{ vars.ALLOW_PROD_DEPLOY }}
         run: |
-          if [ "$ENVIRONMENT" = "prod" ]; then
-            echo "::error::prod deploys are out of capstone scope. envs/prod exists in the infrastructure repository as a reviewed statement of intent and has never been applied - there is nothing running to deploy to. See docs/adr/0002-multi-environment-strategy.md in petclinic-infra."
-            exit 1
+          if [ "$ENVIRONMENT" != "prod" ]; then
+            echo "Target '${ENVIRONMENT}' is deployable."
+            exit 0
           fi
-          echo "Target '${ENVIRONMENT}' is deployable."
+
+          if [ "${ALLOW_PROD_DEPLOY:-}" = "true" ]; then
+            echo "::warning::ALLOW_PROD_DEPLOY is true. Deploying to prod - this changes real, billable infrastructure."
+            exit 0
+          fi
+
+          echo "::error::Refusing to deploy to prod. envs/prod has never been applied, so there is probably nothing running to deploy to - see docs/environments.md in petclinic-infra. To override, set the ALLOW_PROD_DEPLOY repository variable to exactly \"true\". It is currently \"${ALLOW_PROD_DEPLOY:-<unset>}\"."
+          exit 1
 
   deploy:
-    name: Deploy ${{ inputs.version }} to ${{ inputs.environment }}
+    name: Deploy ${{ inputs.version || 'the latest release' }} to ${{ inputs.environment }}
     runs-on: [self-hosted, gcp, ops]
     needs: guard
     if: github.event_name == 'workflow_dispatch'
@@ -73,15 +81,31 @@ jobs:
       contents: read
 
     steps:
-      - name: Validate the version input
+      - name: Resolve the version
+        id: version
         env:
           VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
+
+          if [ -z "$VERSION" ]; then
+            VERSION="$(git ls-remote --tags --refs --sort=-v:refname \
+                         "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git" 'v*' \
+                       | head -1 | sed 's|.*refs/tags/||')"
+
+            if [ -z "$VERSION" ]; then
+              echo "::error::No version was given and ${GITHUB_REPOSITORY} has no release tag to fall back on."
+              exit 1
+            fi
+            echo "::notice::No version given; deploying the latest release ${VERSION}."
+          fi
+
           if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "::error::'${VERSION}' is not a release tag. Expected vMAJOR.MINOR.PATCH, for example v1.2.0."
             exit 1
           fi
+
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "Deploying version ${VERSION}."
 
       - name: Put the gcloud CLI on PATH
@@ -101,7 +125,7 @@ jobs:
       - name: Resolve the version to an image digest
         id: resolve
         env:
-          VERSION: ${{ inputs.version }}
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
 
@@ -488,7 +512,7 @@ jobs:
       - name: Deployment summary
         if: always()
         env:
-          VERSION: ${{ inputs.version }}
+          VERSION: ${{ steps.version.outputs.version }}
           ENVIRONMENT: ${{ inputs.environment }}
           DIGEST: ${{ steps.resolve.outputs.digest }}
           IMAGE: ${{ steps.resolve.outputs.image }}
