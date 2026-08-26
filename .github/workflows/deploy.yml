@@ -36,11 +36,14 @@ env:
   LB_BACKEND_SERVICE: petclinic-${{ inputs.environment }}-lb-backend
   APP_REGION: europe-west3
 
-  # The rolling deploy writes the digest here; the infrastructure repository
-  # reads it on every plan.
   APP_MIG: petclinic-${{ inputs.environment }}-app-mig
   APP_INSTANCE_PREFIX: petclinic-${{ inputs.environment }}-app-
-  DEPLOY_STATE_BUCKET: petclinic-capstone-tfstate
+
+  # The rolling deploy writes the digest here; the infrastructure repository
+  # reads it on every plan. Its own bucket, not the Terraform state bucket:
+  # sa-ops-vm holds unconditioned objectUser here and nothing at all on state.
+  # See ADR 0019 in petclinic-infra.
+  DEPLOY_BUCKET: petclinic-capstone-deploy
   INFRA_APPLY_WORKFLOW: terraform-apply.yml
 
 jobs:
@@ -187,7 +190,7 @@ jobs:
           ENVIRONMENT: ${{ inputs.environment }}
         run: |
           set -euo pipefail
-          OBJECT="gs://${DEPLOY_STATE_BUCKET}/deploy/${ENVIRONMENT}/app-image-digest"
+          OBJECT="gs://${DEPLOY_BUCKET}/deploy/${ENVIRONMENT}/app-image-digest"
 
           # Not "|| true": swallowing this once reported a 403 as "first deploy",
           # which is a different thing and hid the real cause.
@@ -199,7 +202,8 @@ jobs:
             echo "Could not read the current digest:"
             sed 's/^/  /' "${RUNNER_TEMP}/cat.err"
             echo "Either nothing is recorded yet, or the object is unreadable."
-            echo "The write below decides which."
+            echo "The write below decides which - a first deploy to ${ENVIRONMENT}"
+            echo "creates the object, and anything else fails here."
           fi
 
           printf '%s' "$DIGEST" | gcloud storage cp - "$OBJECT"
@@ -310,7 +314,7 @@ jobs:
           fi
 
           if [ "${ON_TEMPLATE}" != "${DIGEST}" ]; then
-            echo "::error::The apply completed but left ${ON_TEMPLATE} on the template, not ${DIGEST}. The digest object was probably not read - check that deploy/${ENVIRONMENT}/app-image-digest in the state bucket holds the value this run wrote."
+            echo "::error::The apply completed but left ${ON_TEMPLATE} on the template, not ${DIGEST}. The digest object was probably not read - check that gs://${DEPLOY_BUCKET}/deploy/${ENVIRONMENT}/app-image-digest holds the value this run wrote."
             exit 1
           fi
 
@@ -481,20 +485,36 @@ jobs:
           echo "count=${#INSTANCES[@]}" >> "$GITHUB_OUTPUT"
           exit "$FAILED"
 
+      # Advisory: IAP may legitimately refuse the runner, and the link is worth
+      # printing either way. continue-on-error would mark this green even when
+      # gcloud itself errored, so every expected failure is handled explicitly
+      # and the step is only ever green when it really did check something.
       - name: Verify through the load balancer
         id: lb
-        continue-on-error: true
         if: always()
         run: |
           set -euo pipefail
 
-          LB_IP="$(gcloud compute addresses describe "$LB_ADDRESS_NAME" \
-                     --global --format='value(address)')"
+          if ! LB_IP="$(gcloud compute addresses describe "$LB_ADDRESS_NAME" \
+                          --global --format='value(address)' \
+                          2>"${RUNNER_TEMP}/lb-address.err")"; then
+            echo "result=no-address" >> "$GITHUB_OUTPUT"
+            sed 's/^/  /' "${RUNNER_TEMP}/lb-address.err"
+            echo "::warning::No global address named ${LB_ADDRESS_NAME}, so ${{ inputs.environment }} has no load balancer to check. Apply the environment before deploying to it."
+            exit 0
+          fi
+
           LB_URL="https://${LB_IP}.sslip.io"
           echo "url=${LB_URL}" >> "$GITHUB_OUTPUT"
 
-          AUDIENCE="$(gcloud compute backend-services describe "$LB_BACKEND_SERVICE" \
-                        --global --format='value(iap.oauth2ClientId)')"
+          if ! AUDIENCE="$(gcloud compute backend-services describe "$LB_BACKEND_SERVICE" \
+                             --global --format='value(iap.oauth2ClientId)' \
+                             2>"${RUNNER_TEMP}/lb-backend.err")"; then
+            echo "result=no-backend" >> "$GITHUB_OUTPUT"
+            sed 's/^/  /' "${RUNNER_TEMP}/lb-backend.err"
+            echo "::warning::Could not read backend service ${LB_BACKEND_SERVICE}, so there is nothing to check through. The environment is probably not fully applied."
+            exit 0
+          fi
 
           if [ -z "$AUDIENCE" ]; then
             echo "result=no-client" >> "$GITHUB_OUTPUT"
@@ -502,8 +522,12 @@ jobs:
             exit 0
           fi
 
-          TOKEN="$(curl -sf -H 'Metadata-Flavor: Google' \
-            "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/identity?audience=${AUDIENCE}&format=full")"
+          if ! TOKEN="$(curl -sf --max-time 10 -H 'Metadata-Flavor: Google' \
+                 "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/identity?audience=${AUDIENCE}&format=full")"; then
+            echo "result=no-token" >> "$GITHUB_OUTPUT"
+            echo "::warning::The metadata server did not issue an identity token for ${AUDIENCE}. The load balancer was not checked; per-instance health above is unaffected."
+            exit 0
+          fi
 
           CODE="$(curl -s -o /dev/null -w '%{http_code}' -k --max-time 20 \
                     -H "Authorization: Bearer ${TOKEN}" "${LB_URL}/" || echo 000)"
@@ -535,11 +559,26 @@ jobs:
           LB_URL: ${{ steps.lb.outputs.url }}
           LB_CODE: ${{ steps.lb.outputs.code }}
           LB_RESULT: ${{ steps.lb.outputs.result }}
+          JOB_STATUS: ${{ job.status }}
+          RECORD_OUTCOME: ${{ steps.record.outcome }}
+          INFRA_OUTCOME: ${{ steps.infra.outcome }}
         run: |
           set -euo pipefail
 
+          # This step is if:always(), so it runs after failures too. Nothing
+          # below may assert that something happened without checking that the
+          # step responsible for it actually succeeded - a failed run once
+          # published "Deployed v1.8.0 to qa" over a deploy that wrote nothing.
           {
-            echo "## Deployed ${VERSION:-?} to ${ENVIRONMENT:-?}"
+            if [ "${JOB_STATUS}" = "success" ]; then
+              echo "## Deployed ${VERSION:-?} to ${ENVIRONMENT:-?}"
+            else
+              echo "## Deploy of ${VERSION:-?} to ${ENVIRONMENT:-?} did not complete"
+              echo
+              echo "> The job finished as \`${JOB_STATUS}\`. What is recorded below is what"
+              echo "> the run actually reached, not a deployment. See the failing step in"
+              echo "> the log for the cause."
+            fi
             echo
 
             if [ -n "${LB_URL:-}" ]; then
@@ -563,12 +602,28 @@ jobs:
             echo "| Instances | ${VM_COUNT:-0} |"
             echo
 
-            echo "### How this shipped"
-            echo
-            echo "The digest was written to \`gs://${DEPLOY_STATE_BUCKET}/deploy/${ENVIRONMENT}/app-image-digest\`,"
-            echo "then \`${INFRA_REPO}\` applied: the instance template was rebuilt around the new"
-            echo "metadata and the group replaced its instances, \`max_unavailable = 0\`. Nothing"
-            echo "connected to a VM - the image was already complete."
+            if [ "${JOB_STATUS}" = "success" ]; then
+              echo "### How this shipped"
+              echo
+              echo "The digest was written to \`gs://${DEPLOY_BUCKET}/deploy/${ENVIRONMENT}/app-image-digest\`,"
+              echo "then \`${INFRA_REPO}\` applied: the instance template was rebuilt around the new"
+              echo "metadata and the group replaced its instances, \`max_unavailable = 0\`. Nothing"
+              echo "connected to a VM - the image was already complete."
+            else
+              echo "### How far this got"
+              echo
+              case "${RECORD_OUTCOME:-skipped}" in
+                success) echo "- Digest recorded at \`gs://${DEPLOY_BUCKET}/deploy/${ENVIRONMENT}/app-image-digest\`." ;;
+                failure) echo "- **Digest not recorded.** \`gs://${DEPLOY_BUCKET}/deploy/${ENVIRONMENT}/app-image-digest\` still holds whatever it held before this run." ;;
+                *)       echo "- Digest not recorded - the run failed before that step." ;;
+              esac
+              case "${INFRA_OUTCOME:-skipped}" in
+                success) echo "- Infrastructure apply completed." ;;
+                failure) echo "- **Infrastructure apply failed.** ${ENVIRONMENT} may be partly changed." ;;
+                *)       echo "- No infrastructure apply was dispatched." ;;
+              esac
+              echo "- Nothing below should be read as a successful rollout."
+            fi
             if [ -n "${INFRA_RUN_URL:-}" ]; then
               echo
               echo "[Infrastructure apply run](${INFRA_RUN_URL})"
@@ -598,6 +653,9 @@ jobs:
               ok)         echo " HTTP ${LB_CODE} through IAP." ;;
               forbidden)  echo " HTTP ${LB_CODE} — IAP refused the runner's identity. \`sa-ops-vm\` is not on the backend service's accessor list. The link above works for a human on the allow-list." ;;
               no-client)  echo " Not checked — the backend service still uses the Google-managed OAuth client, which has no programmatic access. Apply the infra change that moves it to a custom client." ;;
+              no-address) echo " Not checked — there is no global address named \`${LB_ADDRESS_NAME}\`, so ${ENVIRONMENT} has no load balancer. Apply the environment before deploying to it." ;;
+              no-backend) echo " Not checked — backend service \`${LB_BACKEND_SERVICE}\` could not be read. ${ENVIRONMENT} is probably not fully applied." ;;
+              no-token)   echo " Not checked — the metadata server did not issue an identity token. Per-instance health above is unaffected." ;;
               unexpected) echo " HTTP ${LB_CODE} — unexpected. Check the backend service health." ;;
               *)          echo "Not checked." ;;
             esac
